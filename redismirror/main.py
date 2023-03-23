@@ -1,106 +1,79 @@
-import click
 import sys
-import redis
-from time import sleep
 import re
-import threading
+import redis
+import click
 
 
+# Set up command line options
 @click.command()
 @click.option("--shost", type=str, default="127.0.0.1", help="Source redis host/IP.")
 @click.option("--sport", type=int, default=6379, help="Source redis port.")
 @click.option("--sdb", type=int, default="0", required=False, help="Source redis DB.")
-@click.option(
-    "--sauth", default=None, type=str, required=False, help="Source redis auth info."
-)
-@click.option(
-    "--dhost", type=str, default="127.0.0.1", help="Destination redis host/IP."
-)
+@click.option("--sauth", default=None, type=str, required=False, help="Source redis auth info.")
+@click.option("--dhost", type=str, default="127.0.0.1", help="Destination redis host/IP.")
 @click.option("--dport", type=int, default=6377, help="Destination redis port.")
-@click.option(
-    "--ddb", type=int, default="0", required=False, help="Destination redis DB."
-)
-@click.option(
-    "--dauth",
-    default=None,
-    type=str,
-    required=False,
-    help="Destination redis auth info.",
-)
+@click.option("--ddb", type=int, default="0", required=False, help="Destination redis DB.")
+@click.option( "--dauth", default=None, type=str, required=False, help="Destination redis auth info.")
 @click.option("--limit", type=int, help="Stop mirror process at limit X.")
-@click.option(
-    "--replace", type=bool, is_flag=True, default=False, help="Replace key if exists."
-)
-def main(shost, sport, sdb, sauth, dhost, dport, ddb, dauth, limit, replace):
-    """The main function
+@click.option("--replace", type=bool, is_flag=True, default=False, help="Replace key if exists.")
+@click.option("--ttl", type=bool, is_flag=True, default=False, help="Enable to mirrored the TTL value for each key if exist")
+@click.option("--ttle", type=int, default=-1, help="Increase the TTL value of the key with custom value.")
 
-    Args:
-        shost (str): source redis host
-        sport (int): source redis port
-        sdb (int): source redis database number
-        sauth (str): source redis auth info
-        dhost (str): destination redis host
-        dport (int): destination redis port
-        ddb (int): destination redis database number
-        dauth (str): destination redis auth info
-        limit (int): number of iterations to stop script on it
-        replace (bool): replace key if exists
+
+def main(shost, sport, sdb, sauth, dhost, dport, ddb, dauth, limit, replace, ttl, ttle):
     """
-    s = makeConnection(shost, sport, sdb, sauth)
-    d = makeConnection(dhost, dport, ddb, dauth)
-    getSTDOUT(s, d, limit, replace)
-
-
-def makeConnection(host, port, db, auth):
-    """Function to create redis connection
-
-    Note:
-        If the connection failed, the program will exit 1
-
-    Args:
-        host (str): redis connection string
-        port (int): redis port number
-        db (int): redis database name
-        auth (str): auth info for redis
-
-    Returns:
-        connection: connection object for redis
+    Main function that connects to the source and destination Redis instances, then starts mirroring keys
+    based on the specified command line options.
     """
-    if auth:
-        pool = redis.ConnectionPool(host=host, port=port, db=db, password=auth)
-    else:
-        pool = redis.ConnectionPool(host=host, port=port, db=db)
+    source = make_connection(shost, sport, sdb, sauth)
+    destination = make_connection(dhost, dport, ddb, dauth)
+    get_stdout(source, destination, limit, replace, ttl, ttle)
+
+
+skip_commands_list = [
+    'FLUSHDB', 'INFO', 'FLUSHALL', 'AUTH', 'QUIT', 'SELECT', 'CLIENT', 'ROLE',
+    'BGREWRITEAOF', 'TIME', 'ECHO', 'CONFIG', 'MONITOR', 'SYNC', 'SHUTDOWN',
+    'DBSIZE', 'DEBUG', 'COMMAND', 'SCRIPT', 'SAVE', 'OBJECT', 'SLAVEOF',
+    'KEYS', 'BGSAVE', 'SCAN', 'DUMP', 'SLOWLOG', 'TTL', 'PING', 'LASTSAVE'
+]
+
+
+def make_connection(host, port, db, auth):
+    """
+    Create a connection to a Redis instance with the specified host, port, DB, and authentication.
+    """
+    # Create a connection pool
+    pool = redis.ConnectionPool(
+        host=host, port=port, db=db,
+        password=auth) if auth else redis.ConnectionPool(host=host, port=port, db=db)
     r = redis.StrictRedis(connection_pool=pool)
+
+    # Test connection
     try:
         r.ping()
-        print(f"Redis is connected, Host; {host}, Port:{port}, DB:{db}")
+        print(f"Connected to Redis: Host: {host}, Port: {port}, DB: {db}")
     except Exception as e:
-        print(f"Redis connection error ({e})")
+        print(f"Redis connection error: ({e})")
         sys.exit(1)
+
     return r
 
 
 def split(delimiters, data, maxsplit=0):
-    """Split input redis monitor data stram and get the key name
-
-    Args:
-        delimiters str: [description]
-        data str: [description]
-        maxsplit (int, optional): max split length. Defaults to 0.
-
-    Returns:
-        str: redis key name
+    """
+    Split the input data based on the specified delimiters and maxsplit.
     """
     try:
-        regexPattern = "|".join(map(re.escape, delimiters))
-        data = re.split(regexPattern, data, maxsplit)
+        regex_pattern = "|".join(map(re.escape, delimiters))
+        data = re.split(regex_pattern, data, maxsplit)
+        command = data[1]
         data = data[3]
-        return data
+        return data, command
     except Exception as e:
-        return None
+        return None, None
 
 
-def stdinStream():
+def stdin_stream(timeout=0.5):
     """Get STDIN
 
     Returns:
@@ -114,30 +87,40 @@ def stdinStream():
     return input_stream
 
 
-def getSTDOUT(sourceConnection, destinationConnection, limit, replace):
-    """Read STDIN
-       dump from source redis
-       restore key to destination redis
-
-    Args:
-        sourceConnection (connection): redis source connection object
-        destinationConnection (connection): redis destination connection object
-        limit (int): number to stop mirror process
-        replace (bool): replace key if exists in the destination redis
+def get_stdout(source_conn, dest_conn, limit, replace, ttl, ttle):
+    """
+    Read keys from the source Redis instance and mirror them to the destination Redis instance,
+    based on the specified options.
     """
     counter = 0
-    for line in stdinStream():
-        key = split('"', line, 5)
-        if not key == None and '] "DUMP" "' not in line:
-            counter = counter + 1
-            data = sourceConnection.dump(key)
+
+    for line in stdin_stream():
+        key, command = split('"', line, 5)
+        if command in skip_commands_list:
+            print(f"☀  Skipping Key -> {command}, Key -> {key}")
+        elif key is not None and '] "DUMP" "' not in line:
+            counter += 1
+            data = source_conn.dump(key)
+            key_original_ttl = source_conn.ttl(key)
+            if ttl and key_original_ttl > 0:
+                key_ttl = ttle + key_original_ttl
+            else:
+                key_ttl = ttle
             try:
-                destinationConnection.restore(key, 0, data, replace=replace)
-                print(f"Mirrored key | {key}")
+                if command == "psetex":
+                    print("command is psetex")
+                    data = str(data).encode('utf-8')
+                    return_val = dest_conn.psetex(name=key, time_ms=key_ttl, value=data)
+                return_val = dest_conn.restore(name=key, ttl=key_ttl, value=data, replace=replace)
+                if key_ttl > 0:
+                    dest_conn.expire(key, key_ttl)
+                print(
+                    f"✔  Mirrored key | Key: {key}, TTL: {key_ttl}, Status: {return_val.decode('utf-8')} - Command",
+                    command)
             except Exception as e:
-                print(f"Skip {key} becouse of  {e}")
+                print(f"Skipping operation '{key}' due to error: {e}")
             if counter == limit:
-                print(f"Limit reached {counter}")
+                print(f"Limit reached: {counter}")
                 sys.exit(0)
 
 
